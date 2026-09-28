@@ -6,11 +6,11 @@
 
 这是独立的社区工具，与 OpenAI 无隶属关系。
 
-[源码仓库](https://gitee.com/hangev8/codex-config-repair) · [发行版与下载](https://gitee.com/hangev8/codex-config-repair/releases) · [反馈问题](https://gitee.com/hangev8/codex-config-repair/issues) · [更新日志](CHANGELOG.md)
+[GitHub 仓库](https://github.com/han258456/codex-config-repair) · [Gitee 仓库](https://gitee.com/hangev8/codex-config-repair) · [GitHub 发行版](https://github.com/han258456/codex-config-repair/releases) · [Gitee 发行版](https://gitee.com/hangev8/codex-config-repair/releases) · [更新日志](CHANGELOG.md)
 
 ## 给普通使用者
 
-Windows 便携包由维护者手动上传到 [Gitee 发行版](https://gitee.com/hangev8/codex-config-repair/releases)。若暂未看到附件，可按下文从源码运行。
+Windows 便携包由维护者手动上传到 [GitHub 发行版](https://github.com/han258456/codex-config-repair/releases)或 [Gitee 发行版](https://gitee.com/hangev8/codex-config-repair/releases)。若暂未看到附件，可按下文从源码运行。
 
 1. 解压 `CodexConfigRepair-1.1.0-windows-x64.zip`，保留整个文件夹。
 2. 双击其中的 `CodexConfigRepair.exe`。无需安装 Python。
@@ -128,6 +128,8 @@ scripts/build_windows.py 便携包和源码包构建
 本项目自身代码使用 [MIT 协议](LICENSE)。第三方依赖保留各自许可证，详见 [第三方组件说明](THIRD_PARTY_NOTICES.md)。
 
 参与开发请阅读 [贡献指南](CONTRIBUTING.md)，版本变更见 [更新日志](CHANGELOG.md)。仓库只发布源码；Windows 便携包由维护者上传到发行版附件。
+
+问题反馈可提交至 [GitHub Issues](https://github.com/han258456/codex-config-repair/issues) 或 [Gitee Issues](https://gitee.com/hangev8/codex-config-repair/issues)，请勿附带真实密钥、登录文件和原始会话备份。
 
 ## 参考资料
 
