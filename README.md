@@ -6,7 +6,11 @@
 
 这是独立的社区工具，与 OpenAI 无隶属关系。
 
+[源码仓库](https://gitee.com/hangev8/codex-config-repair) · [发行版与下载](https://gitee.com/hangev8/codex-config-repair/releases) · [反馈问题](https://gitee.com/hangev8/codex-config-repair/issues) · [更新日志](CHANGELOG.md)
+
 ## 给普通使用者
+
+Windows 便携包由维护者手动上传到 [Gitee 发行版](https://gitee.com/hangev8/codex-config-repair/releases)。若暂未看到附件，可按下文从源码运行。
 
 1. 解压 `CodexConfigRepair-1.1.0-windows-x64.zip`，保留整个文件夹。
 2. 双击其中的 `CodexConfigRepair.exe`。无需安装 Python。
