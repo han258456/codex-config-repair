@@ -67,7 +67,7 @@ def main():
     versions['Python'] = {'version': sys.version.split()[0], 'license': 'PSF'}
     (licenses / 'DEPENDENCIES.json').write_text(json.dumps(versions, indent=2), encoding='utf-8')
     print('Verifying the packaged executable on synthetic data...', flush=True)
-    smoke = subprocess.run([str(bundle / 'CodexConfigRepair.exe'), '--smoke-test', '--screenshot', str(artifacts / 'packaged-preview.png')], cwd=ROOT, timeout=90)
+    smoke = subprocess.run([str(bundle / 'CodexConfigRepair.exe'), '--smoke-test', '--screenshot', str(artifacts / 'packaged-preview.png')], cwd=ROOT, timeout=180)
     if smoke.returncode:
         raise SystemExit('打包程序的界面烟雾测试失败，未生成发布 ZIP。')
     release = ROOT / 'release'

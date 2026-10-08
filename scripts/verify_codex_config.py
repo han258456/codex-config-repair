@@ -12,6 +12,7 @@ import threading
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from codex_repair.engine import ConnectionSettings, Options, analyze, execute, RELAY_PROVIDER
+from codex_repair import __version__
 
 
 def check(codex: str, home: Path, expected: str):
@@ -51,7 +52,7 @@ def check(codex: str, home: Path, expected: str):
                         raise RuntimeError('Local Codex rejected the synthetic configuration.')
                     return result.get('result', {})
         try:
-            send({'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'codex_config_repair_validation', 'version': '1.1.0'}}})
+            send({'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'codex_config_repair_validation', 'version': __version__}}})
             receive(1)
             send({'method': 'initialized'})
             send({'id': 2, 'method': 'config/read', 'params': {'includeLayers': False}})

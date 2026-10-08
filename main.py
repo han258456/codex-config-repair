@@ -67,7 +67,7 @@ def main():
         QTest.mouseClick(window.repair_button, Qt.MouseButton.LeftButton)
         wait_idle()
         assert window.last_backup is not None, window.message.text()
-        window.change_page(2)
+        window.change_page(3)
         assert window.backup_table.topLevelItemCount() == 1
         assert window.restore_button.isEnabled()
         QTest.mouseClick(window.restore_button, Qt.MouseButton.LeftButton)
@@ -120,7 +120,7 @@ def main():
         assert connection_summary(home)['has_key']
         direct_backup = window.last_backup
         # Pick exact backups: multiple operations may share a timestamp second.
-        window.change_page(2)
+        window.change_page(3)
         for backup in [direct_backup, relay_backup]:
             for i in range(window.backup_table.topLevelItemCount()):
                 item = window.backup_table.topLevelItem(i)
@@ -131,9 +131,99 @@ def main():
             QTest.mouseClick(window.restore_button, Qt.MouseButton.LeftButton)
             wait_idle()
             assert json.loads((backup / 'manifest.json').read_text(encoding='utf-8'))['state'] == 'restored'
+        # Content editing handles invalid originals without touching real data.
+        from codex_repair.engine import read_toml
+        from PySide6.QtWidgets import QFileDialog
+        secret = 'FAKE_GUI_CONTENT_SECRET'
+        broken = ('```toml\r\nmodel = “demo-model”\r\nmodel_supports_reasoning_summaries = True\r\n'
+                  'model_provider = "openai"\r\napi_key = "' + secret + '"\r\n```\r\n').encode('utf-8')
+        config = home / 'config.toml'
+        config.write_bytes(broken)
+        window.change_page(2)
+        assert window.content_editor.isReadOnly()
+        assert secret not in window.content_editor.toPlainText()
+        QTest.mouseClick(window.content_scan, Qt.MouseButton.LeftButton)
+        wait_idle()
+        assert window.content_check is not None and not window.content_check.valid
+        assert not window.content_apply.isEnabled()
+        assert config.read_bytes() == broken
+        # Invalid-content reports must be available, and never contain input.
+        original_dialog = QFileDialog.getSaveFileName
+        report_path = home / 'content-report.json'
+        QFileDialog.getSaveFileName = lambda *a, **kw: (str(report_path), '')
+        try:
+            QTest.mouseClick(window.content_export, Qt.MouseButton.LeftButton)
+        finally:
+            QFileDialog.getSaveFileName = original_dialog
+        assert report_path.is_file() and secret not in report_path.read_text(encoding='utf-8')
+        imported = home / 'import-content.toml'
+        imported.write_bytes(broken.decode('utf-8').encode('utf-16'))
+        original_open_dialog = QFileDialog.getOpenFileName
+        QFileDialog.getOpenFileName = lambda *a, **kw: (str(imported), '')
+        try:
+            QTest.mouseClick(window.content_import, Qt.MouseButton.LeftButton)
+        finally:
+            QFileDialog.getOpenFileName = original_open_dialog
+        assert window._content_text == broken.decode('utf-8')
+        assert window.content_check is None and window.content_plan is None
+        assert config.read_bytes() == broken
+        QTest.mouseClick(window.content_auto, Qt.MouseButton.LeftButton)
+        wait_idle()
+        assert window.content_plan is not None, window.content_message.text()
+        assert len(window.content_check.fixes) >= 3
+        assert config.read_bytes() == broken
+        assert secret not in window.content_diff.toPlainText()
+        assert secret not in json.dumps(window.content_plan.report(), ensure_ascii=False)
+        assert secret not in window.content_editor.toPlainText()
+        # Editing invalidates the preview; hiding raw content keeps the edits.
+        QTest.mouseClick(window.content_show, Qt.MouseButton.LeftButton)
+        assert not window.content_editor.isReadOnly()
+        assert secret in window.content_editor.toPlainText()
+        edited = window.content_editor.toPlainText().replace('demo-model', 'edited-demo-model')
+        window.content_editor.setPlainText(edited)
+        assert window.content_plan is None and not window.content_apply.isEnabled()
+        QTest.mouseClick(window.content_show, Qt.MouseButton.LeftButton)
+        assert window._content_text == edited and secret not in window.content_editor.toPlainText()
+        QTest.mouseClick(window.content_scan, Qt.MouseButton.LeftButton)
+        wait_idle()
+        assert window.content_plan is not None and window.content_apply.isEnabled()
+        window.probe = lambda: ['codex.exe']
+        window.update_availability()
+        assert not window.content_apply.isEnabled() and window.content_scan.isEnabled()
+        window.probe = original_probe
+        window.update_availability()
+        if args.screenshot:
+            window.content_tabs.setCurrentIndex(0)
+            assert window.grab().save(str(args.screenshot.with_stem(args.screenshot.stem + '-content')))
+            window.content_tabs.setCurrentIndex(1)
+            assert window.grab().save(str(args.screenshot.with_stem(args.screenshot.stem + '-content-check')))
+        QTest.mouseClick(window.content_apply, Qt.MouseButton.LeftButton)
+        wait_idle()
+        content_backup = window.last_backup
+        assert content_backup is not None
+        assert (content_backup / 'originals' / 'config.toml').read_bytes() == broken
+        assert read_toml(config)[1]['model'] == 'edited-demo-model'
+        assert b'\r\n' in config.read_bytes()
+        assert window.content_editor.isReadOnly() and not window.content_show.isChecked()
+        assert secret not in window.content_editor.toPlainText()
+        window.change_page(3)
+        for i in range(window.backup_table.topLevelItemCount()):
+            item = window.backup_table.topLevelItem(i)
+            if item.data(0, Qt.ItemDataRole.UserRole)['path'] == content_backup:
+                window.backup_table.setCurrentItem(item)
+                break
+        QTest.mouseClick(window.restore_button, Qt.MouseButton.LeftButton)
+        wait_idle()
+        assert config.read_bytes() == broken
+        window.change_page(2)
+        assert window.content_original_hash is not None
+        window.home_edit.setText(str(home / 'missing-directory'))
+        assert window.content_plan is None and window.content_check is None
+        assert window.content_original_hash is None and not window.content_apply.isEnabled()
+        assert not window._content_text and not window.content_editor.toPlainText()
         window.close()
         temporary.cleanup()
-        print(json.dumps({"gui_scan": "passed", "gui_repair": "passed", "gui_restore": "passed", "gui_relay_switch": "passed", "gui_direct_switch": "passed", "gui_connection_restore": "passed", "fixture_only": True}))
+        print(json.dumps({"gui_scan": "passed", "gui_repair": "passed", "gui_restore": "passed", "gui_relay_switch": "passed", "gui_direct_switch": "passed", "gui_connection_restore": "passed", "gui_content_check": "passed", "gui_content_auto_fix": "passed", "gui_content_edit": "passed", "gui_content_save_restore": "passed", "gui_content_redaction": "passed", "fixture_only": True}))
         return 0
     result = app.exec()
     if temporary:

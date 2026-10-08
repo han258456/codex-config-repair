@@ -13,8 +13,10 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .content import check_content
 from .engine import (ConnectionSettings, Options, Plan, RELAY_PROVIDER, RepairError, analyze,
-                     connection_summary, default_home, execute, list_backups, restore, running_codex)
+                     analyze_content, connection_summary, default_home, execute, list_backups,
+                     read_config_content, redact_toml, restore, running_codex, sha)
 
 
 STYLE = """
@@ -140,6 +142,12 @@ class MainWindow(QMainWindow):
         self.plan: Plan | None = None
         self.connection_plan: Plan | None = None
         self.connection_loaded_home: str | None = None
+        self.content_plan: Plan | None = None
+        self.content_check = None
+        self.content_loaded_home: str | None = None
+        self.content_original_hash: str | None = None
+        self._content_text = ""
+        self._content_syncing = False
         self.worker: Worker | None = None
         self.probe = process_probe
         self.last_backup: Path | None = None
@@ -170,7 +178,7 @@ class MainWindow(QMainWindow):
         side.addWidget(label("CONFIG & HISTORY REPAIR", "brandSub"))
         side.addSpacing(30)
         self.nav = []
-        for index, text in enumerate(["01   检查与修复", "02   连接切换", "03   备份与恢复", "04   使用帮助"]):
+        for index, text in enumerate(["01   检查与修复", "02   连接切换", "03   配置内容修复", "04   备份与恢复", "05   使用帮助"]):
             button = QPushButton(text)
             button.setObjectName("nav")
             button.setCheckable(True)
@@ -187,6 +195,7 @@ class MainWindow(QMainWindow):
         shell.addWidget(self.pages, 1)
         self._make_repair_page(home or default_home(), source)
         self._make_connection_page()
+        self._make_content_page()
         self._make_backups_page()
         self._make_help_page()
         self.change_page(0)
@@ -263,6 +272,7 @@ class MainWindow(QMainWindow):
             form.addLayout(row)
         self.home_edit.textChanged.connect(self.invalidate)
         self.home_edit.textChanged.connect(self.connection_home_changed)
+        self.home_edit.textChanged.connect(self.content_home_changed)
         self.source_edit.textChanged.connect(self.invalidate)
         layout.addWidget(paths)
 
@@ -492,13 +502,236 @@ class MainWindow(QMainWindow):
         self.invalidate_connection()
         self.relay_key.clear()
         self.connection_loaded_home = None
+        self.content_home_changed()
         self.connection_message.setText("切换完成，校验通过。重新打开 Codex 后生效；备份已保存，可在备份页恢复。")
         self.log.appendPlainText("连接切换备份：" + str(backup))
         self.refresh_backups()
 
+    def _make_content_page(self):
+        layout = self.page()
+        self.heading(layout, "CONFIG CONTENT  /  本地检查与编辑", "检查内容，修复配置。",
+                     "自动修复明确的格式错误，或手动编辑配置；预览后先备份，再保存。")
+        frame = card()
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(18, 14, 18, 14)
+        self.content_home = label("", "subtle", True)
+        inner.addWidget(self.content_home)
+        controls = QHBoxLayout()
+        self.content_show = CheckBox("显示并编辑原文（可能包含密钥）")
+        self.content_show.toggled.connect(self.render_content)
+        controls.addWidget(self.content_show)
+        controls.addStretch()
+        self.content_import = QPushButton("导入配置内容")
+        self.content_import.clicked.connect(self.import_content)
+        self.content_reload = QPushButton("重新读取")
+        self.content_reload.clicked.connect(self.load_content)
+        controls.addWidget(self.content_import)
+        controls.addWidget(self.content_reload)
+        inner.addLayout(controls)
+        inner.addWidget(label("默认仅显示脱敏内容。勾选后可编辑原文；导入和自动修复只更新编辑区，点击保存才写入文件。", "subtle", True))
+        layout.addWidget(frame)
+        self.content_tabs = QTabWidget()
+        self.content_editor = QPlainTextEdit()
+        self.content_editor.setFont(QFont("Consolas", 10))
+        self.content_editor.setAccessibleName("配置内容编辑区")
+        self.content_editor.setPlaceholderText("选择包含 config.toml 的目录，点击「重新读取」。损坏的配置也可以打开。")
+        self.content_editor.setMinimumHeight(280)
+        self.content_editor.setReadOnly(True)
+        self.content_editor.textChanged.connect(self.content_edited)
+        self.content_issues = QTreeWidget()
+        self.content_issues.setHeaderLabels(["级别", "位置", "检查结果"])
+        self.content_issues.setRootIsDecorated(False)
+        self.content_issues.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.content_issues.itemDoubleClicked.connect(self.goto_content_issue)
+        self.content_diff = QPlainTextEdit()
+        self.content_diff.setReadOnly(True)
+        self.content_diff.setFont(QFont("Consolas", 10))
+        self.content_diff.setPlaceholderText("检查通过后显示脱敏差异。")
+        self.content_tabs.addTab(self.content_editor, "配置内容")
+        self.content_tabs.addTab(self.content_issues, "检查结果")
+        self.content_tabs.addTab(self.content_diff, "脱敏差异")
+        layout.addWidget(self.content_tabs, 1)
+        self.content_message = label("读取配置后，可以检查内容或编辑。", "subtle", True)
+        layout.addWidget(self.content_message)
+        self.content_progress = QProgressBar()
+        self.content_progress.setTextVisible(False)
+        self.content_progress.setValue(0)
+        layout.addWidget(self.content_progress)
+        actions = QHBoxLayout()
+        self.content_export = QPushButton("导出检测报告")
+        self.content_export.clicked.connect(self.export_content_report)
+        self.content_scan = QPushButton("检查并预览")
+        self.content_scan.clicked.connect(lambda: self.scan_content(False))
+        self.content_auto = QPushButton("自动修复并预览")
+        self.content_auto.clicked.connect(lambda: self.scan_content(True))
+        self.content_apply = QPushButton("备份并保存")
+        self.content_apply.setObjectName("primary")
+        self.content_apply.clicked.connect(self.apply_content)
+        actions.addWidget(self.content_export)
+        actions.addStretch()
+        actions.addWidget(self.content_scan)
+        actions.addWidget(self.content_auto)
+        actions.addWidget(self.content_apply)
+        layout.addLayout(actions)
+
+    def content_home_changed(self, *_):
+        self.content_loaded_home = None
+        self.content_original_hash = None
+        self._content_text = ""
+        if hasattr(self, "content_show"):
+            self.content_show.setChecked(False)
+            self.render_content()
+            self.invalidate_content()
+
+    def load_content(self):
+        if self.busy:
+            return
+        self.content_home_changed()
+        self.content_home.setText("配置文件：" + str(Path(self.home_edit.text()).expanduser() / "config.toml") + "（目录可在检查与修复页更改）")
+        self.content_loaded_home = self.home_edit.text()
+        try:
+            raw, text = read_config_content(Path(self.home_edit.text()).expanduser() / "config.toml")
+        except (RepairError, OSError, ValueError):
+            self.content_message.setText("读取失败，请选择含 config.toml 的目录。支持 UTF-8 / UTF-16，文件不能超过 2 MB。")
+            self.update_availability()
+            return
+        self.content_original_hash = sha(raw)
+        self._content_text = text
+        self.render_content()
+        self.content_message.setText("已读取原文件。可以直接检查，或勾选显示原文后编辑；保存前会自动备份。")
+        self.update_availability()
+
+    def render_content(self, *_):
+        self._content_syncing = True
+        self.content_editor.setReadOnly(not self.content_show.isChecked())
+        self.content_editor.setPlainText(self._content_text if self.content_show.isChecked() else
+                                         redact_toml(self._content_text) if self._content_text else "")
+        self._content_syncing = False
+
+    def content_edited(self):
+        if self._content_syncing or not self.content_show.isChecked():
+            return
+        self._content_text = self.content_editor.toPlainText()
+        self.invalidate_content()
+
+    def invalidate_content(self):
+        self.content_plan = None
+        self.content_check = None
+        if hasattr(self, "content_message"):
+            self.content_message.setStyleSheet("")
+            self.content_message.setText("内容已更新，请检查并预览后保存。")
+            self.content_diff.clear()
+            self.content_issues.clear()
+            self.update_availability()
+
+    def import_content(self):
+        if self.busy or self.content_original_hash is None:
+            return
+        selected, _ = QFileDialog.getOpenFileName(self, "导入配置内容（不会立即保存）", self.home_edit.text(),
+                                                 "配置文件 (*.toml *.toml-bf *.bak);;所有文件 (*)")
+        if not selected:
+            return
+        try:
+            _, text = read_config_content(Path(selected))
+        except (RepairError, OSError, ValueError):
+            self.content_message.setText("导入失败。请选择 2 MB 以内的 UTF-8 / UTF-16 配置文件。")
+            return
+        self._content_text = text
+        self.render_content()
+        self.invalidate_content()
+        self.content_message.setText("已导入编辑区，请检查并预览。目标仍是所选目录的 config.toml。")
+
+    def scan_content(self, auto_fix=False):
+        if self.busy or self.content_original_hash is None:
+            return
+        home = Path(self.home_edit.text().strip()).expanduser()
+        text, original_hash = self._content_text, self.content_original_hash
+        self.content_plan = None
+        self.content_check = None
+        self.content_diff.clear()
+
+        def job(progress):
+            progress("正在检查配置内容…")
+            result = check_content(text, auto_fix)
+            plan = analyze_content(home, result.text, original_hash, progress) if result.valid else None
+            return result, plan
+
+        self.launch(job, self.show_content_plan)
+
+    def show_content_plan(self, result):
+        check, plan = result
+        self.content_check, self.content_plan = check, plan
+        self._content_text = check.text
+        self.render_content()
+        self.content_issues.clear()
+        names = {"error": "需修正", "warning": "提示", "info": "说明"}
+        for issue in check.issues:
+            item = QTreeWidgetItem([names.get(issue.severity, "说明"), f"第 {issue.line} 行" if issue.line else "—", issue.message])
+            item.setData(0, Qt.ItemDataRole.UserRole, issue.line)
+            item.setToolTip(2, issue.message)
+            self.content_issues.addTopLevelItem(item)
+        for fix in check.fixes:
+            self.content_issues.addTopLevelItem(QTreeWidgetItem(["已修复", "—", fix]))
+        if plan:
+            for note in plan.notes:
+                self.content_issues.addTopLevelItem(QTreeWidgetItem(["说明", "—", note]))
+            self.content_diff.setPlainText(plan.config_diff or ("敏感配置有更新，具体值已隐藏。" if plan.needed else "配置内容无需修改。"))
+            action = "退出 Codex 后可备份并保存。" if self.probe() else "点击「备份并保存」应用。"
+            prefix = f"已自动修复 {len(check.fixes)} 类问题；" if check.fixes else ""
+            self.content_message.setText(prefix + "检查通过。" + (action if plan.needed else "内容未改变，无需保存。"))
+        else:
+            errors = sum(issue.severity == "error" for issue in check.issues)
+            self.content_message.setText(f"发现 {errors} 个需修正的问题，请在编辑区修改后重新检查。原文件尚未改变。")
+        self.content_tabs.setCurrentIndex(1)
+
+    def goto_content_issue(self, item, column):
+        line = item.data(0, Qt.ItemDataRole.UserRole)
+        if not line or not self.content_show.isChecked():
+            return
+        block = self.content_editor.document().findBlockByNumber(line - 1)
+        if block.isValid():
+            cursor = self.content_editor.textCursor()
+            cursor.setPosition(block.position())
+            self.content_editor.setTextCursor(cursor)
+            self.content_tabs.setCurrentIndex(0)
+            self.content_editor.setFocus()
+
+    def apply_content(self):
+        if self.content_plan is None or self.busy:
+            return
+        plan = self.content_plan
+        self.launch(lambda progress: execute(plan, progress, self.probe), self.content_done)
+
+    def content_done(self, backup):
+        self.last_backup = backup
+        self.invalidate()
+        self.connection_home_changed()
+        self.content_home_changed()
+        self.content_message.setText("配置已保存，校验通过。原文件已自动备份，可在备份页完整恢复。重新打开 Codex 后生效。")
+        self.log.appendPlainText("配置内容修复备份：" + str(backup))
+        self.refresh_backups()
+
+    def export_content_report(self):
+        if self.content_check is None or self.busy:
+            return
+        report = self.content_plan.report() if self.content_plan else {"operation": "content_repair", "valid": False}
+        report["content_check"] = {
+            "valid": self.content_check.valid,
+            "issues": [{"severity": i.severity, "message": i.message, "line": i.line, "fixable": i.fixable}
+                       for i in self.content_check.issues],
+            "fixes": self.content_check.fixes,
+        }
+        path, _ = QFileDialog.getSaveFileName(self, "保存脱敏检测报告", "codex-content-report.json", "JSON 文件 (*.json)")
+        if path:
+            try:
+                Path(path).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.content_message.setText("已导出脱敏检测报告。")
+            except OSError:
+                self.on_error("报告无法保存，请选择可写入的位置。")
+
     def _make_backups_page(self):
         layout = self.page()
-        self.heading(layout, "RECOVERY CENTER", "每次修改，都有备份。", "修复和连接切换的备份均保存在所选 Codex 目录的 repair-backups 文件夹。连续操作请从新到旧逐次恢复。")
+        self.heading(layout, "RECOVERY CENTER", "每次修改，都有备份。", "历史修复、连接切换和配置内容保存的备份均保存在所选 Codex 目录的 repair-backups 文件夹。连续操作请从新到旧逐次恢复。")
         top = QHBoxLayout()
         top.addStretch()
         refresh = QPushButton("刷新列表")
@@ -535,6 +768,7 @@ class MainWindow(QMainWindow):
             ("02", "退出 Codex 后修复", "保存正在进行的工作，关闭 Codex 桌面程序和命令行。返回本工具点击「备份并修复」；完成后重新打开 Codex。"),
             ("03", "按需恢复", "在「备份与恢复」中选择该次备份。工具先校验文件，再回滚受影响字段，保留无关的新会话。若有冲突则停止自动恢复。"),
             ("04", "切换直连与中转", "进入「连接切换」，选 OpenAI 直连或填写中转接口地址、密钥和可选模型名称。预览后退出 Codex，点击「备份并切换」。中转需支持 Responses API。切回直连沿用已有官方登录，保存的中转密钥可供下次切换使用。"),
+            ("05", "修复配置内容", "进入「配置内容修复」，读取或导入配置。勾选显示原文后可手动编辑；点击检查或自动修复查看结果和脱敏差异。检查通过后退出 Codex，备份并保存。无法明确判断的问题需手动修改；更换提供方后可在检查与修复页兼容历史记录。"),
         ]:
             frame = card()
             inner = QVBoxLayout(frame)
@@ -560,6 +794,9 @@ class MainWindow(QMainWindow):
             if self.connection_loaded_home != self.home_edit.text() and not self.busy:
                 self.load_connection()
         if index == 2:
+            if self.content_loaded_home != self.home_edit.text() and not self.busy:
+                self.load_content()
+        if index == 3:
             self.refresh_backups()
 
     def invalidate(self, *_):
@@ -602,6 +839,13 @@ class MainWindow(QMainWindow):
         self.connection_reload.setEnabled(not self.busy)
         self.connection_apply.setEnabled(not self.busy and not running and self.connection_plan is not None and self.connection_plan.needed)
         self.connection_export.setEnabled(not self.busy and self.connection_plan is not None)
+        has_content = self.content_original_hash is not None
+        for widget in [self.content_scan, self.content_auto, self.content_import, self.content_show]:
+            widget.setEnabled(not self.busy and has_content)
+        self.content_reload.setEnabled(not self.busy)
+        self.content_editor.setEnabled(not self.busy and has_content)
+        self.content_apply.setEnabled(not self.busy and not running and self.content_plan is not None and self.content_plan.needed)
+        self.content_export.setEnabled(not self.busy and self.content_check is not None)
         for widget in [self.direct_button, self.relay_button, self.connection_model, self.connection_history]:
             widget.setEnabled(not self.busy)
         for widget in [self.relay_url, self.relay_key, self.show_key]:
@@ -617,8 +861,10 @@ class MainWindow(QMainWindow):
         self.busy = True
         self.message.setStyleSheet("")
         self.connection_message.setStyleSheet("")
+        self.content_message.setStyleSheet("")
         self.progress_bar.setRange(0, 0)
         self.connection_progress.setRange(0, 0)
+        self.content_progress.setRange(0, 0)
         self.update_availability()
         self.worker = Worker(function, self)
         self.worker.progress.connect(self.on_progress)
@@ -631,6 +877,7 @@ class MainWindow(QMainWindow):
         self.message.setText(text)
         self.restore_message.setText(text)
         self.connection_message.setText(text)
+        self.content_message.setText(text)
         self.log.appendPlainText(text)
 
     def on_error(self, text):
@@ -639,6 +886,8 @@ class MainWindow(QMainWindow):
         self.restore_message.setText(text)
         self.connection_message.setStyleSheet("color: #A43D39;")
         self.connection_message.setText(text)
+        self.content_message.setStyleSheet("color: #A43D39;")
+        self.content_message.setText(text)
         self.log.appendPlainText("未完成：" + text)
         self.refresh_backups()
 
@@ -652,10 +901,16 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self.connection_progress.setRange(0, 100)
         self.connection_progress.setValue(100)
+        self.content_progress.setRange(0, 100)
+        self.content_progress.setValue(100)
         if self.pages.currentIndex() == 1 and self.connection_loaded_home is None:
             completed_text = self.connection_message.text()
             self.load_connection()
             self.connection_message.setText(completed_text)
+        if self.pages.currentIndex() == 2 and self.content_loaded_home is None:
+            completed_text = self.content_message.text()
+            self.load_content()
+            self.content_message.setText(completed_text)
         self.update_availability()
 
     def scan(self):
@@ -705,6 +960,7 @@ class MainWindow(QMainWindow):
         self.last_backup = backup
         self.plan = None
         self.connection_home_changed()
+        self.content_home_changed()
         self.message.setText("修复完成，校验通过。现在可以重新打开 Codex；备份已保存，可在备份页查看。")
         self.log.appendPlainText("备份位置：" + str(backup))
         self.refresh_backups()
@@ -740,6 +996,7 @@ class MainWindow(QMainWindow):
     def restore_done(self, backup):
         self.plan = None
         self.connection_home_changed()
+        self.content_home_changed()
         self.restore_message.setText("该次修复已恢复，校验通过。其他会话保持不变。")
         self.refresh_backups()
 

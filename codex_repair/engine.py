@@ -22,6 +22,7 @@ import tomlkit
 FORMAT = "codex-config-repair/v1"
 BACKUP_DIR = "repair-backups"
 MAX_HEADER = 8 * 1024 * 1024
+MAX_CONFIG = 2 * 1024 * 1024
 UUID_END = re.compile(r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\.jsonl$")
 RUNTIME_SERVERS = {"node_repl", "cua_repl"}
 RELAY_PROVIDER = "codex_repair_relay"
@@ -120,36 +121,45 @@ def read_toml(path: Path):
 
 
 def redact_toml(text: str) -> str:
-    # Parse values first so multi-line credentials cannot leak through a line filter.
+    # Rebuild only the display document: comments and original formatting can
+    # contain credentials even when their associated setting is not sensitive.
+    # The source text and all data used for writing remain untouched.
     try:
-        document = tomlkit.parse(text)
-        def sanitize(table, trail=()):
-            sensitive = bool(trail and (trail[-1] in {"env", "http_headers", "auth"} or trail[-2:] == ("shell_environment_policy", "set")))
-            for key in list(table):
-                value = table[key]
-                if sensitive or SECRET.search(str(key)):
-                    table[key] = "•••• 已隐藏 ••••"
-                elif isinstance(value, dict):
-                    sanitize(value, (*trail, str(key)))
-        sanitize(document)
+        hidden = "•••• 已隐藏 ••••"
+
+        def sanitize(value, trail=()):
+            if isinstance(value, dict):
+                sensitive = bool(trail and (trail[-1] in {"env", "http_headers", "auth"}
+                                            or trail[-2:] == ("shell_environment_policy", "set")))
+                safe = {}
+                for key, child in value.items():
+                    if sensitive or SECRET.search(str(key)):
+                        safe[key] = hidden
+                    elif key == "args" and trail[:1] == ("mcp_servers",):
+                        # Arguments may pass a secret via positional arguments,
+                        # flags, nested scripts, or inline assignments.
+                        safe[key] = [hidden]
+                    else:
+                        safe[key] = sanitize(child, (*trail, str(key)))
+                return safe
+            if isinstance(value, list):
+                return [sanitize(child, trail) for child in value]
+            if isinstance(value, str):
+                # A URL may be embedded in a command or another string. Hide
+                # the entire value when credentials/query/fragment delimiters
+                # occur after it, including malformed values with whitespace.
+                if re.search(r"https?://[\s\S]*[@?#]", value, re.I):
+                    return hidden
+                if SECRET.search(value) and re.search(r"(?:--?|\b)(?:api[-_]?key|token|secret|password|authorization|bearer)\b", value, re.I):
+                    return hidden
+            return value
+
+        document = tomlkit.document()
+        document.update(sanitize(tomlkit.parse(text).unwrap()))
         text = tomlkit.dumps(document)
     except Exception:
         return "配置无法安全脱敏，未展示原文。"
-    output = []
-    sensitive_table = False
-    for line in text.splitlines():
-        if line.lstrip().startswith("#") and SECRET.search(line):
-            output.append("# 敏感注释已隐藏")
-            continue
-        if line.lstrip().startswith("["):
-            sensitive_table = bool(re.search(r"\.env\]|shell_environment_policy\.set|http_headers\]", line))
-        match = re.match(r"(\s*[^#=]+?\s*=)\s*(.*)", line)
-        if match and (sensitive_table or SECRET.search(match.group(1))):
-            line = match.group(1) + ' "•••• 已隐藏 ••••"'
-        line = re.sub(r"(https?://)[^/\s\"']+@", r"\1[已隐藏]@", line)
-        line = re.sub(r"(https?://[^\s\"'?]+)\?[^\s\"']+", r"\1?[已隐藏]", line)
-        output.append(line)
-    return "\n".join(output)
+    return text.rstrip("\r\n")
 
 
 @dataclass(frozen=True)
@@ -244,6 +254,8 @@ class Options:
     merge_mcp: bool = False
     repair_history: bool = True
     connection: ConnectionSettings = field(default_factory=ConnectionSettings)
+    edited_content: str | None = field(default=None, repr=False)
+    content_original_hash: str | None = None
 
 
 @dataclass
@@ -290,7 +302,8 @@ class Plan:
         return sha(json.dumps(payload, sort_keys=True).encode())
 
     def report(self) -> dict:
-        return {"tool": FORMAT, "provider": self.provider, "model": self.model,
+        return {"tool": FORMAT, "operation": "content_repair" if self.options.edited_content is not None else "repair",
+                "provider": self.provider, "model": self.model,
                 "projects_added": self.projects_added, "mcp_added": self.mcp_added,
                 "legacy_threads": len(self.rows), "legacy_providers": self.provider_counts,
                 "rollout_files": sum(c.kind == "rollout" for c in self.changes),
@@ -487,6 +500,8 @@ def analyze(home: Path, source: Path | None = None, options: Options = Options()
     home = home.expanduser().resolve()
     if not home.is_dir():
         raise RepairError("所选 Codex 目录不存在。")
+    if options.edited_content is not None:
+        return _analyze_content(home, options, progress)
     progress("读取当前配置与旧配置…")
     current_raw, current = read_toml(safe_path(home, "config.toml"))
     old = old_raw = None
@@ -541,6 +556,68 @@ def analyze(home: Path, source: Path | None = None, options: Options = Options()
     return Plan(home, source, options, provider, model, changes, rows,
                 state_name, history_name, notes, projects, mcp, diff, sha(old_raw) if old_raw is not None else None,
                 sha(current_raw), counts)
+
+
+def read_config_content(path: Path) -> tuple[bytes, str]:
+    """Read an editable local file without requiring its original TOML to parse."""
+    try:
+        if path.stat().st_size > MAX_CONFIG:
+            raise RepairError("配置文件超过 2 MB，无法在内容编辑器中处理。")
+        raw = path.read_bytes()
+        if len(raw) > MAX_CONFIG:
+            raise RepairError("配置文件超过 2 MB，无法在内容编辑器中处理。")
+        encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+        return raw, raw.decode(encoding)
+    except OSError:
+        raise RepairError("无法读取配置文件，请检查所选路径和访问权限。") from None
+    except UnicodeError:
+        raise RepairError("配置文件编码无法识别，请先转换为 UTF-8 后重新导入。") from None
+
+
+def analyze_content(home: Path, text: str, original_hash: str | None = None, progress=lambda text: None) -> Plan:
+    options = Options(False, False, False, edited_content=text, content_original_hash=original_hash)
+    return analyze(home, options=options, progress=progress)
+
+
+def _analyze_content(home: Path, options: Options, progress) -> Plan:
+    from .content import check_content
+
+    progress("检查配置内容和当前文件版本…")
+    current_raw, original = read_config_content(safe_path(home, "config.toml"))
+    if options.content_original_hash and sha(current_raw) != options.content_original_hash:
+        raise RepairError("当前配置在读取后发生变化，请重新读取文件，再编辑和预览。")
+    text = options.edited_content
+    if len(text.encode("utf-8")) > MAX_CONFIG:
+        raise RepairError("配置内容超过 2 MB，请缩小文件后再处理。")
+    checked = check_content(text)
+    if not checked.valid:
+        errors = [issue.message for issue in checked.issues if issue.severity == "error"]
+        raise RepairError("配置尚有错误，无法保存：" + "；".join(errors[:3]))
+    normalized = checked.text.replace("\r\n", "\n").replace("\r", "\n")
+    if b"\r\n" in current_raw or "\r\n" in original:
+        normalized = normalized.replace("\n", "\r\n")
+    payload = (b"\xef\xbb\xbf" if current_raw.startswith(b"\xef\xbb\xbf") else b"") + normalized.encode("utf-8")
+    document = tomlkit.parse(normalized)
+    changes = [Change("config.toml", sha(current_raw), sha(payload), "config", payload)] if current_raw != payload else []
+    diff = "\n".join(difflib.unified_diff(redact_toml(original).splitlines(),
+                                       redact_toml(normalized).splitlines(),
+                                       fromfile="当前配置", tofile="内容修复后配置", lineterm=""))
+    notes = ["本次仅保存经过检查的 config.toml；写入前自动备份原始文件。",
+             "内容编辑区保留密钥原文；检测报告和差异预览自动隐藏敏感值。",
+             "检查覆盖 TOML 语法和已支持的常见配置项；接口连通性与所有版本兼容性需在 Codex 中验证。"]
+    notes.extend(issue.message for issue in checked.issues if issue.severity != "error")
+    try:
+        old_doc = tomlkit.parse(original)
+    except (ValueError, tomlkit.exceptions.ParseError):
+        notes.append("原文件无法解析，预览隐藏原始正文；备份仍会保存完整原件，可按需恢复。")
+    else:
+        if old_doc.get("model_provider", "openai") != document.get("model_provider", "openai"):
+            notes.append("本次编辑更改了提供方。保存后可到「检查与修复」同步历史记录标记。")
+    if current_raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        notes.append("将 UTF-16 编码转换为 Codex 使用的 UTF-8，原始编码文件会完整备份。")
+    return Plan(home, None, options, str(document.get("model_provider", "openai")),
+                str(document.get("model", "默认模型")), changes, [], None, None,
+                notes, 0, 0, diff, None, sha(current_raw), {})
 
 
 def atomic_json(path: Path, value: dict):
@@ -730,7 +807,7 @@ def execute(plan: Plan, progress=lambda text: None, process_probe=running_codex,
                     raise RepairError("源文件已发生变化，已保留备份并停止操作。")
             manifest["state"] = "applying"
             atomic_json(backup / "manifest.json", manifest)
-            progress("更新配置和历史标记…")
+            progress("保存修复后的配置内容…" if plan.options.edited_content is not None else "更新配置和历史标记…")
             for index, item in enumerate(manifest["files"]):
                 path = safe_path(plan.home, item["relative"])
                 os.replace(safe_path(backup / "staged", item["relative"]), path)
@@ -739,6 +816,8 @@ def execute(plan: Plan, progress=lambda text: None, process_probe=running_codex,
                     fault_hook(index)
             progress("更新并验证分页索引…")
             apply_patches(plan.home, patches)
+            if any(change.kind == "config" for change in plan.changes):
+                read_toml(safe_path(plan.home, "config.toml"))
             for item in manifest["files"]:
                 path = safe_path(plan.home, item["relative"])
                 if file_hash(path) != item["after_hash"] or (item["body_hash"] and file_hash(path, True) != item["body_hash"]):
