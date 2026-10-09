@@ -131,6 +131,154 @@ def main():
             QTest.mouseClick(window.restore_button, Qt.MouseButton.LeftButton)
             wait_idle()
             assert json.loads((backup / 'manifest.json').read_text(encoding='utf-8'))['state'] == 'restored'
+        # Read saved direct/relay files into the candidate form before writing.
+        from PySide6.QtWidgets import QFileDialog, QLineEdit
+        import tomlkit
+        direct_file = home / 'direct-connection.toml'
+        direct_file.write_bytes('model_provider = "openai"\nmodel = "imported-direct-model"\n'.encode('utf-16'))
+        relay_file = home / 'relay-connection.toml-bf'
+        relay_file.write_text('model_provider = "existing_gateway"\nmodel = "imported-relay-model"\n'
+                              '[model_providers.existing_gateway]\nbase_url = "https://import.example.com/v1/"\n'
+                              'wire_api = "responses"\nexperimental_bearer_token = "FAKE_GUI_FILE_KEY"\n', encoding='utf-8')
+        invalid_file = home / 'invalid-connection.bak'
+        invalid_file.write_text('api_key = "FAKE_GUI_FILE_SECRET', encoding='utf-8')
+        original_config = (home / 'config.toml').read_bytes()
+        fixture_auth = home / 'auth.json'
+        fixture_auth.write_bytes(b'{"login":"FAKE_GUI_PRESERVED_LOGIN"}')
+        original_auth = fixture_auth.read_bytes()
+
+        def read_connection_file(path):
+            dialog = QFileDialog.getOpenFileName
+            QFileDialog.getOpenFileName = lambda *a, **kw: (str(path) if path else '', '')
+            try:
+                QTest.mouseClick(window.connection_import, Qt.MouseButton.LeftButton)
+            finally:
+                QFileDialog.getOpenFileName = dialog
+
+        window.change_page(1)
+        for source, provider, model in [(direct_file, 'openai', 'imported-direct-model'),
+                                        (relay_file, RELAY_PROVIDER, 'imported-relay-model')]:
+            source_bytes = source.read_bytes()
+            window.show_key.setChecked(True)
+            read_connection_file(source)
+            assert window.connection_model.text() == model
+            assert window.direct_button.isChecked() == (provider == 'openai')
+            assert not window.show_key.isChecked()
+            assert window.relay_key.echoMode() == QLineEdit.EchoMode.Password
+            assert window.connection_plan is None and not window.connection_apply.isEnabled()
+            assert (home / 'config.toml').read_bytes() == original_config
+            assert source.read_bytes() == source_bytes
+            if provider == RELAY_PROVIDER:
+                assert window.relay_url.text() == 'https://import.example.com/v1'
+                assert window.relay_key.text() == 'FAKE_GUI_FILE_KEY'
+            QTest.mouseClick(window.connection_preview, Qt.MouseButton.LeftButton)
+            wait_idle()
+            assert window.connection_plan is not None, window.connection_message.text()
+            assert window.connection_plan.provider == provider
+            assert 'FAKE_GUI_FILE_KEY' not in window.connection_diff.toPlainText()
+            assert 'FAKE_GUI_FILE_KEY' not in json.dumps(window.connection_plan.report())
+            if args.screenshot and provider == RELAY_PROVIDER:
+                assert window.grab().save(str(args.screenshot.with_stem(args.screenshot.stem + '-connection-import')))
+            QTest.mouseClick(window.connection_apply, Qt.MouseButton.LeftButton)
+            wait_idle()
+            imported_backup = window.last_backup
+            assert connection_summary(home)['provider'] == provider
+            assert connection_summary(home)['model'] == model
+            assert fixture_auth.read_bytes() == original_auth
+            assert source.read_bytes() == source_bytes
+            window.change_page(3)
+            for i in range(window.backup_table.topLevelItemCount()):
+                item = window.backup_table.topLevelItem(i)
+                if item.data(0, Qt.ItemDataRole.UserRole)['path'] == imported_backup:
+                    window.backup_table.setCurrentItem(item)
+                    break
+            QTest.mouseClick(window.restore_button, Qt.MouseButton.LeftButton)
+            wait_idle()
+            assert (home / 'config.toml').read_bytes() == original_config
+            window.change_page(1)
+        read_connection_file(relay_file)
+        form = (window.relay_url.text(), window.relay_key.text(), window.connection_model.text())
+        read_connection_file(None)
+        assert form == (window.relay_url.text(), window.relay_key.text(), window.connection_model.text())
+        read_connection_file(invalid_file)
+        assert form == (window.relay_url.text(), window.relay_key.text(), window.connection_model.text())
+        assert 'FAKE_GUI_FILE_SECRET' not in window.connection_message.text()
+        assert window.connection_plan is None and not window.connection_apply.isEnabled()
+        assert (home / 'config.toml').read_bytes() == original_config
+        # Current custom providers must prefill the active endpoint, without keys.
+        custom = tomlkit.parse(original_config.decode('utf-8'))
+        custom['model_provider'] = 'existing_gateway'
+        custom['model_providers'] = {'existing_gateway': {'base_url': 'https://current.example.com/v1',
+                                                        'experimental_bearer_token': 'FAKE_CURRENT_CUSTOM_KEY'}}
+        (home / 'config.toml').write_bytes(tomlkit.dumps(custom).encode('utf-8'))
+        app.processEvents()
+        QTest.mouseClick(window.connection_reload, Qt.MouseButton.LeftButton)
+        assert window.relay_button.isChecked()
+        assert window.relay_url.text() == 'https://current.example.com/v1', (window.relay_url.text(), window.connection_message.text(), connection_summary(home), window.connection_reload.isEnabled())
+        assert not window.relay_key.text()
+        QTest.mouseClick(window.connection_preview, Qt.MouseButton.LeftButton)
+        wait_idle()
+        assert window.connection_plan is not None, window.connection_message.text()
+        assert 'FAKE_CURRENT_CUSTOM_KEY' not in window.connection_diff.toPlainText()
+        (home / 'config.toml').write_bytes(original_config)
+        QTest.mouseClick(window.connection_reload, Qt.MouseButton.LeftButton)
+        # An orphan and a relocated local rollout must not block either page.
+        import sqlite3
+        from codex_repair.demo import PARENT
+        from codex_repair.engine import ClosingConnection
+        orphan_id = '55555555-5555-4555-8555-555555555555'
+        with sqlite3.connect(home / 'state_5.sqlite', factory=ClosingConnection) as db:
+            original_path = db.execute('SELECT rollout_path FROM threads WHERE id=?', (PARENT,)).fetchone()[0]
+            stale_path = str(home / 'sessions' / 'old-directory' / Path(original_path).name)
+            db.execute('UPDATE threads SET rollout_path=? WHERE id=?', (stale_path, PARENT))
+            db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',
+                       (orphan_id, 'codex', 'archived_sessions/missing-history.jsonl', 'Missing sample', 1, 2, 1, 2))
+        window.change_page(0)
+        QTest.mouseClick(window.scan_button, Qt.MouseButton.LeftButton)
+        wait_idle()
+        assert window.plan is not None, window.message.text()
+        assert len(window.plan.skipped_threads) == len(window.plan.relinked_threads) == 1
+        assert window.repair_button.isEnabled()
+        assert '跳过 1' in window.message.text()
+        assert any(orphan_id in window.preview.topLevelItem(i).text(1)
+                   for i in range(window.preview.topLevelItemCount()))
+        if args.screenshot:
+            assert window.grab().save(str(args.screenshot.with_stem(args.screenshot.stem + '-history-recovery')))
+        window.change_page(1)
+        QTest.mouseClick(window.connection_preview, Qt.MouseButton.LeftButton)
+        wait_idle()
+        assert window.connection_plan is not None, window.connection_message.text()
+        assert len(window.connection_plan.skipped_threads) == len(window.connection_plan.relinked_threads) == 1
+        assert window.connection_apply.isEnabled()
+        assert '跳过 1' in window.connection_message.text()
+        assert orphan_id in window.connection_diff.toPlainText()
+        if args.screenshot:
+            assert window.grab().save(str(args.screenshot.with_stem(args.screenshot.stem + '-connection-recovery')))
+        QTest.mouseClick(window.connection_apply, Qt.MouseButton.LeftButton)
+        wait_idle()
+        recovery_backup = window.last_backup
+        assert '跳过 1' in window.connection_message.text(), window.connection_message.text()
+        with sqlite3.connect(home / 'state_5.sqlite', factory=ClosingConnection) as db:
+            assert db.execute('SELECT rollout_path FROM threads WHERE id=?', (PARENT,)).fetchone()[0] == Path(original_path).as_posix()
+            assert db.execute('SELECT model_provider FROM threads WHERE id=?', (orphan_id,)).fetchone()[0] == 'codex'
+        QTest.mouseClick(window.connection_preview, Qt.MouseButton.LeftButton)
+        wait_idle()
+        assert window.connection_plan is not None and not window.connection_plan.needed
+        assert not window.connection_apply.isEnabled()
+        assert '跳过 1' in window.connection_message.text()
+        window.change_page(3)
+        for i in range(window.backup_table.topLevelItemCount()):
+            item = window.backup_table.topLevelItem(i)
+            if item.data(0, Qt.ItemDataRole.UserRole)['path'] == recovery_backup:
+                window.backup_table.setCurrentItem(item)
+                break
+        QTest.mouseClick(window.restore_button, Qt.MouseButton.LeftButton)
+        wait_idle()
+        assert json.loads((recovery_backup / 'manifest.json').read_text(encoding='utf-8'))['state'] == 'restored'
+        with sqlite3.connect(home / 'state_5.sqlite', factory=ClosingConnection) as db:
+            assert db.execute('SELECT rollout_path FROM threads WHERE id=?', (PARENT,)).fetchone()[0] == stale_path
+            db.execute('UPDATE threads SET rollout_path=? WHERE id=?', (original_path, PARENT))
+            db.execute('DELETE FROM threads WHERE id=?', (orphan_id,))
         # Content editing handles invalid originals without touching real data.
         from codex_repair.engine import read_toml
         from PySide6.QtWidgets import QFileDialog
@@ -223,7 +371,7 @@ def main():
         assert not window._content_text and not window.content_editor.toPlainText()
         window.close()
         temporary.cleanup()
-        print(json.dumps({"gui_scan": "passed", "gui_repair": "passed", "gui_restore": "passed", "gui_relay_switch": "passed", "gui_direct_switch": "passed", "gui_connection_restore": "passed", "gui_content_check": "passed", "gui_content_auto_fix": "passed", "gui_content_edit": "passed", "gui_content_save_restore": "passed", "gui_content_redaction": "passed", "fixture_only": True}))
+        print(json.dumps({"gui_scan": "passed", "gui_repair": "passed", "gui_restore": "passed", "gui_relay_switch": "passed", "gui_direct_switch": "passed", "gui_connection_restore": "passed", "gui_connection_import": "passed", "gui_current_custom_read": "passed", "gui_history_recovery": "passed", "gui_connection_recovery": "passed", "gui_content_check": "passed", "gui_content_auto_fix": "passed", "gui_content_edit": "passed", "gui_content_save_restore": "passed", "gui_content_redaction": "passed", "fixture_only": True}))
         return 0
     result = app.exec()
     if temporary:

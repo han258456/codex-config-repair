@@ -15,8 +15,8 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .content import check_content
 from .engine import (ConnectionSettings, Options, Plan, RELAY_PROVIDER, RepairError, analyze,
-                     analyze_content, connection_summary, default_home, execute, list_backups,
-                     read_config_content, redact_toml, restore, running_codex, sha)
+                      analyze_content, connection_summary, default_home, execute, list_backups,
+                      read_config_content, read_connection_settings, redact_toml, restore, running_codex, sha)
 
 
 STYLE = """
@@ -97,6 +97,28 @@ def card():
     frame = QFrame()
     frame.setObjectName("card")
     return frame
+
+
+def history_summary(plan: Plan, completed=False) -> str:
+    if not plan.options.repair_history:
+        return "本次未兼容历史记录"
+    action = "已更新" if completed else "可更新"
+    paths = "已修正路径" if completed else "待修正路径"
+    skipped = f"跳过 {len(plan.skipped_threads)} 条" + ("（保留原记录）" if plan.skipped_threads else "")
+    return (f"{action} {len(plan.rows)} 条会话索引、"
+            f"{sum(c.kind == 'rollout' for c in plan.changes)} 个历史文件；"
+            f"{skipped}；{paths} {len(plan.relinked_threads)} 条")
+
+
+def history_details(plan: Plan) -> list[tuple[str, str]]:
+    rows = []
+    for thread in plan.skipped_threads:
+        rows.append(("跳过历史 · 保留原记录",
+                     f"会话：{thread['id']}\n原路径：{thread['rollout_path']}\n原因：{thread['reason']}"))
+    for thread in plan.relinked_threads:
+        rows.append(("修正历史路径",
+                     f"会话：{thread['id']}\n原路径：{thread['before']}\n新路径：{thread['after']}"))
+    return rows
 
 
 class Worker(QThread):
@@ -235,7 +257,7 @@ class MainWindow(QMainWindow):
         metrics = QHBoxLayout()
         metrics.setSpacing(12)
         self.metrics = []
-        for title, value, small in [("当前连接", "等待扫描", True), ("待兼容会话", "—", False), ("可恢复项目", "—", False)]:
+        for title, value, small in [("当前连接", "等待扫描", True), ("待更新会话索引", "—", False), ("可恢复项目", "—", False)]:
             frame = card()
             inner = QVBoxLayout(frame)
             inner.setContentsMargins(18, 12, 18, 14)
@@ -293,6 +315,7 @@ class MainWindow(QMainWindow):
         self.preview = QTreeWidget()
         self.preview.setHeaderLabels(["检查项", "处理结果"])
         self.preview.setRootIsDecorated(False)
+        self.preview.setWordWrap(True)
         self.preview.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.preview.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.preview.addTopLevelItem(QTreeWidgetItem(["尚未扫描", "先读取配置与历史索引；扫描不会修改数据。 "]))
@@ -340,7 +363,11 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         self.connection_current = label("等待读取当前连接", "cardTitle", True)
         row.addWidget(self.connection_current, 1)
-        self.connection_reload = QPushButton("重新读取")
+        self.connection_import = QPushButton("读取配置文件")
+        self.connection_import.setAccessibleName("读取已有连接配置文件")
+        self.connection_import.clicked.connect(self.import_connection)
+        row.addWidget(self.connection_import)
+        self.connection_reload = QPushButton("读取当前配置")
         self.connection_reload.clicked.connect(self.load_connection)
         row.addWidget(self.connection_reload)
         current_layout.addLayout(row)
@@ -450,11 +477,39 @@ class MainWindow(QMainWindow):
         mode = "OpenAI 直连" if data["provider"] == "openai" else "第三方中转" if data["provider"] == RELAY_PROVIDER else "自定义连接 · " + data["provider"]
         if data["provider"] == "openai" and data["has_overrides"]:
             mode = "OpenAI（存在地址覆盖）"
-        self.connection_current.setText(f"当前：{mode}   /   模型：{data['model']}")
+        self.connection_current.setText(f"当前：{mode}   /   模型：{data['model'] or '默认模型'}")
         self.relay_url.setText(data["base_url"])
+        self.connection_model.setText(data["model"])
         self.relay_key.setPlaceholderText("已有密钥；地址不变时留空沿用，填写可更新" if data["has_key"] else "填写第三方服务商提供的密钥")
-        (self.relay_button if data["provider"] == RELAY_PROVIDER else self.direct_button).setChecked(True)
+        (self.relay_button if data["selected_mode"] == "relay" else self.direct_button).setChecked(True)
         self.connection_message.setText("已读取当前配置。选择目标连接方式后，点击「预览切换」。")
+
+    def import_connection(self):
+        if self.busy:
+            return
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "读取已有连接配置", self.home_edit.text(),
+            "Codex 配置与备份 (config.toml config.toml-bf *.toml *.toml-bf *.bak);;所有文件 (*)")
+        if not filename:
+            return
+        try:
+            settings = read_connection_settings(Path(filename))
+        except RepairError as error:
+            self.invalidate_connection()
+            self.connection_message.setStyleSheet("color: #A43D39;")
+            self.connection_message.setText(str(error) + "原有表单已保留，请重新预览。")
+            return
+        # Only successful reads replace the candidate form; importing is read-only.
+        self.show_key.setChecked(False)
+        self.relay_url.setText(settings.base_url)
+        self.relay_key.setText(settings.api_key)
+        self.relay_key.setPlaceholderText("填写第三方服务商提供的密钥")
+        self.connection_model.setText(settings.model)
+        (self.relay_button if settings.mode == "relay" else self.direct_button).setChecked(True)
+        self.invalidate_connection()
+        mode = "OpenAI 直连" if settings.mode == "direct" else "第三方中转"
+        credential = "密钥已读取并隐藏。" if settings.api_key else "未读取到可用密钥，请填写后预览。" if settings.mode == "relay" else "沿用当前目录的 OpenAI 登录。"
+        self.connection_message.setText(f"已读取 {Path(filename).name}：{mode}。{credential}点击「预览切换」检查后再应用。")
 
     def connection_mode_changed(self, *_):
         relay = self.relay_button.isChecked()
@@ -485,10 +540,14 @@ class MainWindow(QMainWindow):
         self.connection_plan = plan
         target = "OpenAI 直连" if plan.provider == "openai" else "第三方中转"
         config_changed = any(change.kind == "config" for change in plan.changes)
-        self.connection_diff.setPlainText(plan.config_diff or ("密钥等敏感配置有更新，具体值已隐藏。" if config_changed else "配置内容无需修改。"))
-        history = f"同步 {len(plan.rows)} 条会话索引、{sum(c.kind == 'rollout' for c in plan.changes)} 个历史文件" if plan.options.repair_history else "本次仅切换配置，未同步历史记录"
+        history = history_summary(plan)
+        preview = plan.config_diff or ("密钥等敏感配置有更新，具体值已隐藏。" if config_changed else "配置内容无需修改。")
+        preview += "\n\n历史处理预览\n" + history
+        for title, detail in history_details(plan):
+            preview += "\n\n" + title + "\n" + detail
+        self.connection_diff.setPlainText(preview)
         next_step = "退出 Codex 后可备份并切换。" if self.probe() else "点击「备份并切换」应用。"
-        self.connection_message.setText(f"目标：{target} · {plan.model}；{history}。" + (next_step if plan.needed else "已经一致，无需切换。"))
+        self.connection_message.setText(f"目标：{target} · {plan.model}；{history}。" + (next_step if plan.needed else "可处理部分无需修改。"))
 
     def apply_connection(self):
         if self.connection_plan is None or self.busy:
@@ -497,13 +556,15 @@ class MainWindow(QMainWindow):
         self.launch(lambda progress: execute(plan, progress, self.probe), self.connection_done)
 
     def connection_done(self, backup):
+        plan = self.connection_plan
         self.last_backup = backup
         self.invalidate()
         self.invalidate_connection()
         self.relay_key.clear()
         self.connection_loaded_home = None
         self.content_home_changed()
-        self.connection_message.setText("切换完成，校验通过。重新打开 Codex 后生效；备份已保存，可在备份页恢复。")
+        history = history_summary(plan, completed=True) + "。" if plan is not None else ""
+        self.connection_message.setText("切换完成，校验通过。" + history + "重新打开 Codex 后生效；备份已保存，可在备份页恢复。")
         self.log.appendPlainText("连接切换备份：" + str(backup))
         self.refresh_backups()
 
@@ -781,7 +842,8 @@ class MainWindow(QMainWindow):
         inner.setContentsMargins(20, 18, 20, 18)
         inner.addWidget(label("处理范围", "cardTitle"))
         inner.addWidget(label("支持标准本地 config.toml、JSONL 会话以及已识别结构的分页 SQLite 历史。当前连接和模型优先；不自动恢复旧网关、内置运行路径和旧浏览器校验值。", "subtle", True))
-        inner.addWidget(label("采用独立 profile、外置 sqlite_home、缺失文件或未知数据库结构时，会停止相关操作。不会调用模型、重新登录或上传配置；实际续聊需在 Codex 内验证。", "subtle", True))
+        inner.addWidget(label("缺失文件或目录外路径会先尝试匹配本目录内同一会话的唯一历史文件；找到时修正索引路径，找不到时跳过并保留原记录，不修改目录外文件。多个同一会话的候选文件无法确定时仍停止处理。预览列出数量与明细。", "subtle", True))
+        inner.addWidget(label("采用独立 profile、外置 sqlite_home、未知数据库结构或无法识别的文件格式时，仍会停止相关操作。不会调用模型、重新登录或上传配置；实际续聊需在 Codex 内验证。", "subtle", True))
         inner.addWidget(label("原始备份可能包含配置中的凭据，请仅在本人电脑保管。对外分享可使用已脱敏的检测报告。", "subtle", True))
         layout.addWidget(detail)
         layout.addStretch()
@@ -837,6 +899,7 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(not self.busy and self.plan is not None)
         self.connection_preview.setEnabled(not self.busy)
         self.connection_reload.setEnabled(not self.busy)
+        self.connection_import.setEnabled(not self.busy)
         self.connection_apply.setEnabled(not self.busy and not running and self.connection_plan is not None and self.connection_plan.needed)
         self.connection_export.setEnabled(not self.busy and self.connection_plan is not None)
         has_content = self.content_original_hash is not None
@@ -930,9 +993,10 @@ class MainWindow(QMainWindow):
         self.metrics[2].setText(str(plan.projects_added))
         self.preview.clear()
         rows = [("登录方式 / 模型", f"保留 {plan.provider} · {plan.model}"),
-                ("历史兼容", f"{len(plan.rows)} 条会话索引，{sum(c.kind == 'rollout' for c in plan.changes)} 个历史文件"),
+                ("历史兼容", history_summary(plan)),
                 ("项目与工具", f"补充 {plan.projects_added} 个项目、{plan.mcp_added} 个自定义 MCP 工具"),
                 ("备份方式", "先备份原文件及数据库，再写入；会话正文按 SHA-256 校验")]
+        rows[2:2] = history_details(plan)
         if plan.provider_counts:
             rows.insert(2, ("旧会话提供方", "、".join(f"{name} × {count}" for name, count in plan.provider_counts.items()) + f" → {plan.provider}"))
         rows.extend(("处理说明", note) for note in plan.notes)
@@ -942,12 +1006,18 @@ class MainWindow(QMainWindow):
             self.preview.addTopLevelItem(item)
         self.diff.setPlainText(plan.config_diff or "当前配置无需修改。")
         self.tabs.setCurrentIndex(0)
+        partial = (f"已跳过 {len(plan.skipped_threads)} 条历史记录（保留原记录）；待修正路径 {len(plan.relinked_threads)} 条。"
+                   if plan.skipped_threads or plan.relinked_threads else "")
         if not plan.needed:
-            self.message.setText("扫描完成：当前配置与历史标记已经兼容，无需修复。")
+            if not plan.options.repair_history:
+                self.message.setText("扫描完成：当前配置无需修改；本次未兼容历史记录。")
+            else:
+                self.message.setText(f"扫描完成：可处理部分无需修改；已跳过 {len(plan.skipped_threads)} 条历史记录，保留原记录。" if plan.skipped_threads
+                                     else "扫描完成：当前配置与可处理的历史标记已经兼容，无需修复。")
         elif self.probe():
-            self.message.setText("预览已就绪。保存工作并退出 Codex 后，「备份并修复」会自动可用。")
+            self.message.setText("预览已就绪。" + partial + "保存工作并退出 Codex 后，「备份并修复」会自动可用。")
         else:
-            self.message.setText("预览已就绪。点击「备份并修复」应用以上变更。")
+            self.message.setText("预览已就绪。" + partial + "点击「备份并修复」应用以上变更。")
 
     def repair(self):
         if self.plan is None or self.busy:
@@ -957,11 +1027,13 @@ class MainWindow(QMainWindow):
         self.launch(lambda progress: execute(plan, progress, self.probe), self.repair_done)
 
     def repair_done(self, backup):
+        plan = self.plan
         self.last_backup = backup
         self.plan = None
         self.connection_home_changed()
         self.content_home_changed()
-        self.message.setText("修复完成，校验通过。现在可以重新打开 Codex；备份已保存，可在备份页查看。")
+        history = history_summary(plan, completed=True) + "。" if plan is not None else ""
+        self.message.setText("修复完成，校验通过。" + history + "现在可以重新打开 Codex；备份已保存，可在备份页查看。")
         self.log.appendPlainText("备份位置：" + str(backup))
         self.refresh_backups()
 

@@ -186,16 +186,123 @@ def normalize_base_url(value: str) -> str:
     return value
 
 
+def connection_fields(config, reject_conflicting_urls=True) -> tuple[str, str, dict, str, str]:
+    """Read the main connection only; source data never authorizes commands."""
+    provider = config.get("model_provider", "openai")
+    model = config.get("model", "")
+    if not isinstance(provider, str) or not provider.strip():
+        raise RepairError("配置文件中的 model_provider 必须是非空字符串。")
+    if not isinstance(model, str) or re.search(r"\s|[\x00-\x1f\x7f]", model.strip()):
+        raise RepairError("配置文件中的模型名称无效，请填写不含空格或换行的模型标识。")
+    providers = config.get("model_providers", {})
+    if not isinstance(providers, dict):
+        raise RepairError("配置文件中的 model_providers 必须是 TOML 表。")
+    settings = providers.get(provider, {})
+    if not isinstance(settings, dict):
+        raise RepairError("配置文件中的连接提供方必须是 TOML 表。")
+    base_url = settings.get("base_url", "")
+    if not isinstance(base_url, str):
+        raise RepairError("配置文件中的接口地址必须是字符串。")
+    if provider == "openai" and "openai_base_url" in config:
+        override = config["openai_base_url"]
+        if not isinstance(override, str):
+            raise RepairError("配置文件中的接口地址必须是字符串。")
+        if override.strip():
+            if reject_conflicting_urls and base_url.strip() and normalize_base_url(base_url) != normalize_base_url(override):
+                raise RepairError("配置文件包含不一致的接口地址，无法确定地址与密钥的对应关系；请手动填写连接设置。")
+            base_url = override
+    if provider == "openai" and not base_url.strip():
+        if config.get("chatgpt_base_url"):
+            raise RepairError("此配置包含 ChatGPT 登录地址覆盖，请手动选择连接方式。")
+        return provider, "direct", settings, "", model.strip()
+    return provider, "relay", settings, normalize_base_url(base_url), model.strip()
+
+
+def checked_connection_key(value) -> str:
+    if not isinstance(value, str):
+        raise RepairError("配置文件中的密钥必须是字符串。")
+    key = value.strip()
+    if re.search(r"[\s\x00-\x1f\x7f]", key) or not key.isascii():
+        raise RepairError("密钥包含空格、换行或非英文字符，请检查后重新输入。")
+    return key
+
+
+def provider_key(settings: dict) -> str:
+    """Resolve one declared static credential; do not run dynamic auth."""
+    if "wire_api" in settings and settings["wire_api"] != "responses":
+        raise RepairError("此连接使用的接口协议不支持读取切换，请使用兼容 Responses API 的配置。")
+    if "requires_openai_auth" in settings and not isinstance(settings["requires_openai_auth"], bool):
+        raise RepairError("连接中的 requires_openai_auth 必须是布尔值。")
+    if settings.get("requires_openai_auth") or "auth" in settings:
+        raise RepairError("此连接使用登录或动态认证，无法读取为中转密钥；请手动填写连接设置。")
+    env_headers = settings.get("env_http_headers", {})
+    if not isinstance(env_headers, dict):
+        raise RepairError("连接中的 env_http_headers 必须是 TOML 表。")
+    if any(str(name).lower() == "authorization" for name in env_headers):
+        raise RepairError("此连接使用动态认证头，无法确定中转密钥；请手动填写连接设置。")
+    credentials = []
+    if "experimental_bearer_token" in settings:
+        token = checked_connection_key(settings["experimental_bearer_token"])
+        if token:
+            credentials.append(token)
+    if "env_key" in settings:
+        name = settings["env_key"]
+        if not isinstance(name, str) or not name.strip() or re.search(r"[\s\x00-\x1f\x7f]", name):
+            raise RepairError("连接中的 env_key 必须是有效的环境变量名称。")
+        credentials.append(checked_connection_key(os.environ.get(name, "")))
+    headers = settings.get("http_headers", {})
+    if not isinstance(headers, dict):
+        raise RepairError("连接中的 http_headers 必须是 TOML 表。")
+    for name, value in headers.items():
+        if str(name).lower() != "authorization":
+            continue
+        if not isinstance(value, str):
+            raise RepairError("连接中的认证头必须是字符串。")
+        if not value.strip():
+            continue
+        match = re.fullmatch(r"Bearer\s+(\S+)", value.strip(), re.I)
+        if not match:
+            raise RepairError("此认证头无法读取为中转密钥，请手动填写连接设置。")
+        credentials.append(checked_connection_key(match.group(1)))
+    if len(credentials) > 1:
+        raise RepairError("此连接包含多种认证设置，无法确定使用的密钥；请手动填写连接设置。")
+    return credentials[0] if credentials else ""
+
+
+def read_connection_settings(path: Path) -> ConnectionSettings:
+    _, text = read_config_content(path)
+    try:
+        config = tomlkit.parse(text).unwrap()
+    except (ValueError, tomlkit.exceptions.ParseError):
+        raise RepairError("配置文件的 TOML 格式无效，请先修正后再读取。") from None
+    if not any(key in config for key in ("model", "model_provider", "model_providers", "openai_base_url")):
+        raise RepairError("配置文件中没有可读取的连接或模型设置。")
+    if "profile" in config or config.get("config_profile"):
+        raise RepairError("配置文件启用了 profile，请先将实际连接合并到主配置后再读取。")
+    _, mode, settings, base_url, model = connection_fields(config)
+    key = provider_key(settings) if mode == "relay" else ""
+    return ConnectionSettings(mode, base_url, key, model)
+
+
 def connection_summary(home: Path) -> dict:
     """Return display fields only; never expose a saved credential to the UI."""
     _, config = read_toml(home / "config.toml")
-    provider = config.get("model_provider", "openai")
+    config = config.unwrap()
+    provider, mode, active, base_url, model = connection_fields(config, reject_conflicting_urls=False)
     saved = config.get("model_providers", {}).get(RELAY_PROVIDER, {})
-    if not isinstance(saved, dict):
-        saved = {}
-    return {"provider": str(provider), "model": str(config.get("model", "默认模型")),
-            "base_url": str(saved.get("base_url", "")),
-            "has_key": bool(saved.get("experimental_bearer_token")),
+    if mode == "direct":
+        active = saved if isinstance(saved, dict) else {}
+        try:
+            base_url = normalize_base_url(active.get("base_url", ""))
+        except (RepairError, TypeError, AttributeError):
+            base_url = ""
+    try:
+        credential_url = normalize_base_url(active["base_url"]) if active.get("base_url") else base_url
+        has_key = bool(base_url and credential_url == base_url and provider_key(active))
+    except (RepairError, TypeError, AttributeError):
+        has_key = False
+    return {"provider": provider, "model": model, "selected_mode": mode,
+            "base_url": base_url, "has_key": has_key,
             "has_overrides": bool(config.get("openai_base_url") or config.get("chatgpt_base_url")
                                   or config.get("model_providers", {}).get("openai"))}
 
@@ -227,13 +334,28 @@ def apply_connection(merged, settings: ConnectionSettings, notes: list[str]) -> 
         saved = merged.get("model_providers", {}).get(RELAY_PROVIDER, {})
         if not isinstance(saved, dict):
             raise RepairError("中转配置格式异常，请先检查本工具专用的提供方配置。")
-        key = settings.api_key.strip()
-        if not key and saved.get("base_url") == base_url:
-            key = saved.get("experimental_bearer_token", "")
+        key = checked_connection_key(settings.api_key)
+        if not key:
+            providers = merged.get("model_providers", {})
+            active = providers.get(merged.get("model_provider", "openai"), {})
+            for candidate in (active, saved):
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_base = candidate.get("base_url", "")
+                if not candidate_base and candidate is active and merged.get("model_provider", "openai") == "openai":
+                    candidate_base = merged.get("openai_base_url", "")
+                if not candidate_base:
+                    continue
+                try:
+                    candidate_url = normalize_base_url(candidate_base)
+                except (RepairError, TypeError, AttributeError):
+                    continue
+                if candidate_url == base_url:
+                    key = provider_key(candidate)
+                    if key:
+                        break
         if not isinstance(key, str) or not key:
             raise RepairError("请填写第三方密钥。首次使用或更换接口地址时，必须输入该地址对应的密钥。")
-        if re.search(r"[\s\x00-\x1f\x7f]", key) or not key.isascii():
-            raise RepairError("密钥包含空格、换行或非英文字符，请检查后重新输入。")
         if "model_providers" not in merged:
             merged["model_providers"] = tomlkit.table()
         # A fresh provider table prevents stale auth/header overrides from winning.
@@ -289,6 +411,8 @@ class Plan:
     source_hash: str | None
     config_hash: str
     provider_counts: dict[str, int]
+    skipped_threads: list[dict] = field(default_factory=list)
+    relinked_threads: list[dict] = field(default_factory=list)
 
     @property
     def needed(self) -> bool:
@@ -298,7 +422,8 @@ class Plan:
     def signature(self) -> str:
         payload = {"config": self.config_hash, "source": self.source_hash,
                    "changes": [(c.relative, c.before_hash, c.after_hash) for c in self.changes],
-                   "rows": self.rows, "state": self.state_db, "history": self.history_db}
+                   "rows": self.rows, "state": self.state_db, "history": self.history_db,
+                   "skipped_threads": self.skipped_threads, "relinked_threads": self.relinked_threads}
         return sha(json.dumps(payload, sort_keys=True).encode())
 
     def report(self) -> dict:
@@ -306,6 +431,8 @@ class Plan:
                 "provider": self.provider, "model": self.model,
                 "projects_added": self.projects_added, "mcp_added": self.mcp_added,
                 "legacy_threads": len(self.rows), "legacy_providers": self.provider_counts,
+                "skipped_legacy_threads": len(self.skipped_threads), "skipped_threads": self.skipped_threads,
+                "relinked_legacy_threads": len(self.relinked_threads), "relinked_threads": self.relinked_threads,
                 "rollout_files": sum(c.kind == "rollout" for c in self.changes),
                 "config_changed": any(c.kind == "config" for c in self.changes),
                 "notes": self.notes, "config_diff_redacted": self.config_diff}
@@ -496,6 +623,24 @@ def validate_history_schema(path: Path):
                 raise RepairError("发现未知的历史字节索引字段，已停止迁移以保护历史记录。")
 
 
+def indexed_rollout(home: Path, value) -> tuple[Path | None, str]:
+    """Inspect an indexed path without reading a file outside the selected home."""
+    if not isinstance(value, str) or not value.strip():
+        return None, "历史文件路径为空或无效"
+    try:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = home / candidate
+        candidate = candidate.resolve()
+        if not candidate.is_relative_to(home):
+            return None, "历史文件位于所选目录之外"
+        if not candidate.is_file():
+            return None, "历史文件缺失或不是普通文件"
+        return candidate, ""
+    except (OSError, ValueError, RuntimeError):
+        return None, "历史文件路径无效或无法访问"
+
+
 def analyze(home: Path, source: Path | None = None, options: Options = Options(), progress=lambda text: None) -> Plan:
     home = home.expanduser().resolve()
     if not home.is_dir():
@@ -520,6 +665,8 @@ def analyze(home: Path, source: Path | None = None, options: Options = Options()
     state_name = history_name = None
     rows = []
     counts = {}
+    skipped = []
+    relinked = []
     if options.repair_history:
         sqlite_home = current.get("sqlite_home")
         if sqlite_home and Path(sqlite_home).expanduser().resolve() != home:
@@ -529,18 +676,36 @@ def analyze(home: Path, source: Path | None = None, options: Options = Options()
         history_name = find_database(home, "thread_history")
         records = discover_rollouts(home)
         file_changes = plan_rollout_changes(records, provider)
+        by_id = {r["physical_id"].lower(): r for r in records}
+        by_path = {r["path"].resolve(): r for r in records}
+        rollout_hashes = {c.physical_id: c.before_hash for c in file_changes}
         if state_name:
             with readonly_db(home / state_name) as db:
                 needed = {"id", "model_provider", "rollout_path"}
                 if not needed.issubset(columns(db, "threads")):
                     raise RepairError("会话索引结构暂不支持，已停止历史修复。")
                 for thread_id, old_provider, rollout_path in db.execute("SELECT id,model_provider,rollout_path FROM threads WHERE model_provider != ? ORDER BY id", (provider,)):
-                    candidate = Path(rollout_path)
-                    if not candidate.is_absolute():
-                        candidate = home / candidate
-                    if not candidate.exists() or not candidate.resolve().is_relative_to(home):
-                        raise RepairError("部分旧会话的历史文件缺失或位于所选目录之外，已停止历史迁移。")
-                    rows.append({"id": thread_id, "before": old_provider, "after": provider})
+                    candidate, reason = indexed_rollout(home, rollout_path)
+                    # Existing local bindings take precedence, including forks
+                    # whose public metadata ID differs from the physical ID.
+                    record = by_path.get(candidate) or by_id.get(str(thread_id).lower())
+                    if record is None:
+                        skipped.append({"id": thread_id, "provider": old_provider, "rollout_path": rollout_path,
+                                        "reason": reason or "所选目录内未找到此会话 ID 对应的历史文件"})
+                        continue
+                    # Relink stale paths only to a unique physical ID discovered
+                    # inside home, never by guessing a replacement directory.
+                    actual = record["path"].resolve()
+                    after_path = rollout_path
+                    row = {"id": thread_id, "before": old_provider, "after": provider,
+                           "before_rollout_path": rollout_path}
+                    if candidate != actual:
+                        after_path = actual.as_posix()
+                        relinked.append({"id": thread_id, "before": rollout_path, "after": after_path})
+                        row["rollout_relative"] = record["relative"]
+                        row["rollout_hash"] = rollout_hashes.get(record["physical_id"]) or file_hash(actual)
+                    row["after_rollout_path"] = after_path
+                    rows.append(row)
                     counts[old_provider] = counts.get(old_provider, 0) + 1
         changed_ids = {c.physical_id for c in file_changes}
         needs_paginated = any(r["physical_id"] in changed_ids and r["record"]["payload"].get("history_mode") == "paginated" for r in records)
@@ -550,12 +715,16 @@ def analyze(home: Path, source: Path | None = None, options: Options = Options()
             validate_history_schema(home / history_name)
         changes.extend(file_changes)
         notes.append(f"将旧提供方的会话标记统一为 {provider}，同时维护历史分页和分支索引。")
+        if relinked:
+            notes.append(f"将 {len(relinked)} 条过期历史路径修正为所选目录内会话 ID 唯一匹配的文件，原路径随索引一起备份。")
+        if skipped:
+            notes.append(f"跳过 {len(skipped)} 条无法在所选目录内匹配历史文件的旧会话，保留其原索引和提供方；其余配置与可迁移历史可继续处理。")
     if not source:
         notes.append("未选择旧配置：只处理当前配置与历史兼容性。")
     model = str(tomlkit.parse(merged.decode("utf-8-sig")).get("model", "默认模型"))
     return Plan(home, source, options, provider, model, changes, rows,
                 state_name, history_name, notes, projects, mcp, diff, sha(old_raw) if old_raw is not None else None,
-                sha(current_raw), counts)
+                sha(current_raw), counts, skipped, relinked)
 
 
 def read_config_content(path: Path) -> tuple[bytes, str]:
@@ -640,8 +809,10 @@ def build_db_patches(plan: Plan) -> list[dict]:
     patches = []
     if plan.state_db:
         for row in plan.rows:
+            before = {"model_provider": row["before"], "rollout_path": row["before_rollout_path"]}
+            after = {"model_provider": row["after"], "rollout_path": row["after_rollout_path"]}
             patches.append({"db": plan.state_db, "table": "threads", "key": {"id": row["id"]},
-                            "before": {"model_provider": row["before"]}, "after": {"model_provider": row["after"]}})
+                            "before": before, "after": after})
     if plan.history_db:
         with readonly_db(plan.home / plan.history_db) as db:
             for change in plan.changes:
@@ -675,7 +846,12 @@ ALLOWED_PATCHES = {
 
 def validate_patch(patch: dict):
     allowed = ALLOWED_PATCHES.get(patch.get("table"))
-    if not allowed or set(patch.get("key", {})) != allowed[0] or set(patch.get("before", {})) != allowed[1] or set(patch.get("after", {})) != allowed[1]:
+    value_fields = set(patch.get("before", {}))
+    allowed_values = [allowed[1]] if allowed else []
+    if patch.get("table") == "threads":
+        # Keep v1.0-v1.2 backups, whose patches contain provider only, restorable.
+        allowed_values.append({"model_provider", "rollout_path"})
+    if not allowed or set(patch.get("key", {})) != allowed[0] or value_fields not in allowed_values or set(patch.get("after", {})) != value_fields:
         raise RepairError("备份中的数据库补丁格式无效。")
     stem = "state" if patch["table"] == "threads" else "thread_history"
     if not re.fullmatch(stem + r"_\d+\.sqlite", patch.get("db", "")):
@@ -763,8 +939,13 @@ def execute(plan: Plan, progress=lambda text: None, process_probe=running_codex,
         safe_path(plan.home, BACKUP_DIR)
         backup = backup_root / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8])
         backup.mkdir()
+        changed_paths = {change.relative for change in plan.changes}
+        dependencies = {row["rollout_relative"]: row["rollout_hash"] for row in plan.rows
+                        if "rollout_hash" in row and row["rollout_relative"] not in changed_paths}
         manifest = {"format": FORMAT, "home": str(plan.home), "created_at": datetime.now().isoformat(timespec="microseconds"),
-                    "state": "prepared", "files": [], "patches": patches, "databases": [], "summary": plan.report()}
+                    "state": "prepared", "files": [], "patches": patches, "databases": [], "summary": plan.report(),
+                    "rollout_dependencies": [{"relative": relative, "sha256": digest}
+                                             for relative, digest in sorted(dependencies.items())]}
         progress("创建完整备份…")
         try:
             total_bytes = sum((plan.home / c.relative).stat().st_size * 3 for c in plan.changes)
@@ -805,6 +986,9 @@ def execute(plan: Plan, progress=lambda text: None, process_probe=running_codex,
             for item in manifest["files"]:
                 if file_hash(safe_path(plan.home, item["relative"])) != item["before_hash"]:
                     raise RepairError("源文件已发生变化，已保留备份并停止操作。")
+            for row in plan.rows:
+                if "rollout_hash" in row and file_hash(safe_path(plan.home, row["rollout_relative"])) != row["rollout_hash"]:
+                    raise RepairError("匹配的历史文件已发生变化，请重新扫描。")
             manifest["state"] = "applying"
             atomic_json(backup / "manifest.json", manifest)
             progress("保存修复后的配置内容…" if plan.options.edited_content is not None else "更新配置和历史标记…")
@@ -858,6 +1042,15 @@ def _restore(home: Path, backup: Path, manifest: dict, recovery=False, process_p
         accepted = {item["after_hash"], item["before_hash"]} if recovery else {item["after_hash"]}
         if not path.is_file() or file_hash(path) not in accepted:
             raise RepairError("修复后有文件产生了新内容，自动恢复会覆盖新记录，已停止。请保留备份后手动合并。")
+    # Reverting a path-only relink can disconnect newly appended history even
+    # when no rollout file was rewritten by this operation.
+    for dependency in manifest.get("rollout_dependencies", []):
+        relative = dependency.get("relative", "")
+        if not (relative.startswith(("sessions/", "archived_sessions/")) and relative.endswith(".jsonl")):
+            raise RepairError("备份包含本工具处理范围之外的历史文件依赖，已停止恢复。")
+        path = safe_path(home, relative)
+        if not path.is_file() or file_hash(path) != dependency.get("sha256"):
+            raise RepairError("路径修正后的历史文件产生了新内容或已变化，已停止自动恢复。请保留当前索引和备份后手动检查。")
     connections = {}
     try:
         for patch in manifest["patches"]:
